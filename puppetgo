@@ -1,0 +1,349 @@
+#!/bin/bash
+
+##
+## THIS FILE IS UNDER PUPPET CONTROL. DON'T EDIT IT HERE.
+## Edit on your workstation, clone the repository using 'clone-puppet'
+##
+
+# Copyright (C) 2013-2015 Joerg Jaspert <joerg@ganneff.de>
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# .
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+# .
+# THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+# IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+# OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+# IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+# NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+# THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+# We don't always exit on errors
+# set -e
+# Undefined variables, we don't like you
+set -u
+# ERR traps are inherited by shell functions, command substitutions and
+# commands executed in a subshell environment.
+set -E
+
+debug() {
+    if [[ ${DEBUG} = false ]]; then
+        return
+    fi
+    echo "$@"
+}
+
+usage() {
+    cat <<EOF
+Puppetgo helper by Joerg Jaspert <joerg@ganneff.de>
+
+Either call with no argument for default behaviour or chose one
+of the following:
+
+-g  Debug mode, loads of puppet output
+-d  Devel mode. No double run in case puppet exits with error,
+                ignore /nopuppet,
+                sets --test option for puppet.
+-n  Noop mode.  Sets --noop option for puppet.
+-e  Environment selection. p, prod, production all mean production,
+                all others are given direct to puppet
+-p  Make the environment permanent - that is, put it into /puppetenv
+-x  Extra params for puppet. Whatever is not supported by other
+                options can be set for puppet.
+-w  Wait mode. Waits for a (maybe) running puppet to finish and then runs.
+-h  This screen.
+
+EOF
+    exit 0
+}
+
+if [[ -f /puppetenv ]]; then
+    ENVIRONMENT=$(cat /puppetenv)
+fi
+
+while getopts ":pgdnhwe:x:" OPTION; do
+    case ${OPTION} in
+        g) # debug
+            DEBUG="true"
+            ;;
+        d) # devel
+            DEVMODE="true"
+            IGNNORUN="true"
+            PUPOPT=${PUPOPT:-""}
+            PUPOPT="${PUPOPT} --test"
+            ;;
+        n) # noop
+            PUPOPT=${PUPOPT:-""}
+            PUPOPT="${PUPOPT} --noop"
+            ;;
+        h) # help
+            usage
+            exit 0
+            ;;
+        e) # environment
+            case ${OPTARG} in
+                p|prod|production)
+                    ENVIRONMENT="production"
+                    ;;
+                *)
+                    ENVIRONMENT=${OPTARG}
+                    ;;
+            esac
+            ;;
+        x) # extra params for puppet
+            PUPOPT=${PUPOPT:-""}
+            PUPOPT="${PUPOPT} ${OPTARG}"
+            ;;
+        p) # env permanent
+            PUPPERM="true"
+            ;;
+        w) # wait for other puppet to finish
+            PUPWAIT="true"
+            ;;
+        ?)
+            echo "Unknown option given, try -h"
+            exit 42
+            ;;
+    esac
+done
+
+# Should we output debug log
+DEBUG=${DEBUG:-"false"}
+# Is it devmode time (some more puppet options)
+DEVMODE=${DEVMODE:-"false"}
+# Ignore the "dont run puppet now" file?
+IGNNORUN=${IGNNORUN:-"false"}
+# In which environment do we run puppet
+ENVIRONMENT=${ENVIRONMENT:-"production"}
+# Make the environment permanent?
+PUPPERM=${PUPPERM:-"false"}
+# Which puppet options do we use
+PUPOPT=${PUPOPT:-""}
+PUPOPT="${PUPOPT} --environment ${ENVIRONMENT} --onetime --no-daemonize --detailed-exitcodes"
+# Do we wait for our lock?
+PUPWAIT=${PUPWAIT:-"false"}
+# Which lock do we use
+LOCKFILE=${LOCKFILE:-"/run/puppetgo.lock"}
+# If this exists, we dont run (unless overridden)
+NORUN="/nopuppet"
+# Our output (if run by cron) goes there
+PUPLOG="/var/log/puppet/cron"
+# Pathes to binaries
+TIMEOUT="/usr/bin/timeout"
+PUPPET="/usr/bin/puppet"
+FLOCK="/usr/bin/flock"
+LOCKFREE=0
+# Store the last git rev of puppet.git
+LASTREV="/run/puppet/lastrev"
+# Puppets statefile
+STATEFILE="/var/lib/puppet/state/agent_catalog_run.lock"
+# Users can force us to run, bypassing the revision checks against git
+FORCEPUPPET="/tmp/forcepuppet"
+# Our return code
+RETCODE=0
+
+# Rotate logfiles
+savelog() {
+    torotate="$1"
+    count=${2:-14}
+    while [ ${count} -gt 0 ]; do
+        prev=$(( count - 1 ))
+        if [ -e "${torotate}.${prev}" ]; then
+            mv "${torotate}.${prev}" "${torotate}.${count}"
+        fi
+        count=$prev
+    done
+    mv "${torotate}" "${torotate}.0"
+}
+
+# A human, detected by a tty or devmode option, gets some more puppet options
+HUMAN="false"
+if tty -s || [[ ${DEVMODE} == true ]]; then
+    # Called by human
+    PUPOPT="${PUPOPT} --verbose --no-splay --show_diff --ignorecache "
+    HUMAN="true"
+else
+    # Called by cron
+    exec > "${PUPLOG}" 2>&1 <&-
+fi
+
+# All the rest runs with a lock
+(
+    # If called by a human or the pupwait option is set, we wait a bit of time for the lock
+    if [[ ${PUPWAIT} == true ]] && [[ ${HUMAN} == true ]]; then
+        if [[ -f ${STATEFILE} ]]; then
+            echo "There may be another puppet, we may be waiting up to 2 minutes. Be patient."
+        fi
+        ${FLOCK} --exclusive --wait 120 42 || LOCKFREE=1
+    else
+        ${FLOCK} --exclusive --nonblock 42 || LOCKFREE=1
+    fi
+
+    # Did we get the lock?
+    if [[ $LOCKFREE -gt 0 ]]; then
+        if [[ ${HUMAN} == true ]]; then
+            echo "Lock ${LOCKFILE} exists"
+        fi
+        exit 1
+    fi
+
+    # If we are called by cron, we check if we really have to run.
+    # We only really run if there is
+    #   - a change in git (new revision)
+    #   - the last run is older than 12 hours
+    #   - someone touched ${FORCEPUPPET} - this is used by non-administrators on the machines
+    #     to "ask" for a puppet run. Useful if they have services managed by our puppet - but
+    #     which do not change the git revision of our puppet (say, our puppet checks out another
+    #     git repository for them. When they update it, they touch ${FORCEPUPPET}, so we notice
+    #     it.
+    if [[ ${HUMAN} == false ]]; then
+        DORUN="false"
+        # Check last revision or set a string that can't exist.
+        GITREV=$(cat ${LASTREV} || echo "nolastrev")
+        if [[ ${GITREV} == Miaubar ]]; then
+            # Catch mistake of suddenly having a "Miaubar" "lastrev", which would make
+            # us skip all the following automatic runs...
+            GITREV="brokenlastrev"
+        fi
+        set +e
+        # Simple one-liner files per environment, generated by a simple git rev-parse HEAD for the branch
+        NEWREV=$(wget -q linpuppet.cms.fra.dlh.de/puppetgit/${ENVIRONMENT} -O -)
+        ret=$?
+        set -e
+
+        # wgets error codes aren't all that nice and detailed, but work with em
+        case ${ret} in
+            8) if [[ ${GITREV} != nolastrev ]] && [[ ${ENVIRONMENT} != production ]]; then
+                   # IF we had a gitrev (ie environment existed in past run)
+                   # AND we are not in production
+                   # AND it seems like the environment no longer exists (wget error 8)
+
+                   # -> Check if it really no longer exists, or if its a temp error
+                   set +e
+                   maybeerr=$(wget -O /dev/null -q -S linpuppet.cms.fra.dlh.de/puppetgit/${ENVIRONMENT} 2>&1)
+                   set -e
+                   errreg="HTTP/1.1 404 Not Found.*"
+                   if [[ ${maybeerr} =~ ${errreg} ]]; then
+                       # Yes, the environment we are in no longer exists
+                       rm /puppetenv
+                       # And out, next run will be in production and hopefully work out
+                       exit 0
+                   fi
+               fi
+               ;;&
+            0)  # Its all fine, so we have nothing to adjust here
+                # Just need to ensure we don't end in the *) match
+                :
+                ;;
+            *) NEWREV="Miaubar"
+               ;;
+        esac
+
+        if [[ ${GITREV} != ${NEWREV} ]] || [[ -f ${FORCEPUPPET} ]]; then
+            # If there is a new git rev - or if a user asked for a run
+            DORUN="true"
+            rm -f ${FORCEPUPPET}
+        else
+            # Check how long ago we did a run
+            ctime=$(date +%s)
+            ftime=$(stat -c %Y ${LASTREV})
+            diff=$(( ctime - ftime ))
+            if [[ ${diff} -gt 43200 ]]; then
+                # More than 12 hours ago, run
+                DORUN="true"
+            fi
+        fi
+        if [[ ${DORUN} == false ]]; then
+            # Nothing to do, sleep, puppet, no work
+            exit 0
+        fi
+    fi
+
+    # Store the environment for the future runs
+    if [[ ${PUPPERM} = true ]]; then
+        echo "${ENVIRONMENT}" > /puppetenv
+    fi
+
+    if [[ ! -f ${TIMEOUT} ]]; then
+        echo "Timeout binary not found, please install it."
+        exit 1
+    fi
+
+    if [[ -f ${NORUN} ]] && [[ ${IGNNORUN} == false ]]; then
+        # We may want no puppet
+        # Note that a user wish using ${FORCEPUPPET} does not override ${NORUN} files, admins
+        # have more to say.
+        OFFTIME=$(/usr/bin/stat -c %Y ${NORUN})
+        CHECKTIME=$(( $(date +%s) - ( 60 * 60 * 24 * 2 ) ))
+        if [[ ${OFFTIME} -lt ${CHECKTIME} ]]; then
+            echo "Danger, Will Robinson! Puppet on $(hostname -s) off for more than two days!"
+            echo "${NORUN} generated on $(date -d @${OFFTIME})"
+            exit 1
+        fi
+        debug "Puppet turned off using ${NORUN}, not running"
+        exit 0
+    fi
+
+    # LOADS of output please
+    if [[ ${DEBUG} != false ]]; then
+        PUPOPT="${PUPOPT} --debug"
+    fi
+
+    tries=0
+    # Human run with -d, dont repeat on errors, thats usually just annoying
+    if [[ ${DEVMODE} == true ]]; then
+        maxtries=1
+    else
+        # No -d, so possibly automatic - puppet may need a rerun, try it 2 times
+        maxtries=2
+    fi
+
+    # Work, you beast, or we retry
+    while [[ ${tries} -lt ${maxtries} ]]; do
+        # Puppet may hang itself, guard it in timeouts
+        ${TIMEOUT} -k 400s 300s ${PUPPET} agent ${PUPOPT}
+        RETCODE=$?
+        case ${RETCODE} in
+            124)
+                # Timed out
+                echo "Das war nix, timeout hit..."
+                ;;&
+            4|6)
+                ## According to puppet agent --help those two indicate "there was a failure".
+                ## So we retry the puppet run, and see if it goes away (sometimes it needs
+                ## multiple runs to get all of it)
+                debug "Ein Satz mit X, das war wohl nix, nochmaaaaaaaaaaaaal. (Exit ${RETCODE})"
+                tries=$(( tries +1 ))
+                continue
+                ;;
+            2)
+                ## Just had some changes, not an error
+                RETCODE=0
+                ;;&
+            *)
+                break
+                ;;
+        esac
+    done
+
+    if [[ ${HUMAN} = false ]]; then
+        # If run by cron we store the git rev we just processed.
+        # Run by humans we don't store git revisions, so we ensure at least one more automatic run
+        echo "${NEWREV}" > ${LASTREV}
+        exec > /dev/null 2>&1
+        savelog "${PUPLOG}"
+    fi
+) 42>>${LOCKFILE}
+
+# Return the same code as puppet (well, except 2=0)
+exit ${RETCODE}
