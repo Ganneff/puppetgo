@@ -236,9 +236,36 @@ fi
                    set -e
                    errreg="HTTP/1.1 404 Not Found.*"
                    if [[ ${maybeerr} =~ ${errreg} ]]; then
-                       # Yes, the environment we are in no longer exists
-                       rm /puppetenv
-                       # And out, next run will be in production and hopefully work out
+                       # Yes, the environment we are in (maybe) no
+                       # longer exists
+
+                       # Now, there can be a "race condition" which we
+                       # should work around: With a puppet setup where
+                       # branches are used a lot to develop features,
+                       # environments come and go. Sometimes those
+                       # environments need to be rebased, but should
+                       # continue with the same name (and on the same
+                       # machines). It then happens that one does a
+                       # git push origin :branch && git push origin branch
+                       # and with this deleting the old one, then
+                       # pushing the "new" (rebased) branch.
+
+                       # This happens to make the environment
+                       # non-existent for a while, and even if that
+                       # while is only a few seconds, may mean that
+                       # machines using it accidently switch to the
+                       # production environment.
+
+                       # While this is not an error in puppetgo we
+                       # work around this by only switching back to
+                       # production if the target environment doesn't
+                       # exist for two puppetgo runs in a row.
+                       if [[ ${GITREV} != firstrunnoenv ]]; then
+                           echo "firstrunnoenv" > ${LASTREV}
+                       else
+                           rm /puppetenv
+                       fi
+                       # And out
                        exit 0
                    fi
                fi
