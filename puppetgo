@@ -5,7 +5,7 @@
 ## Edit on your workstation, clone the repository using 'clone-puppet'
 ##
 
-# Copyright (C) 2013-2015 Joerg Jaspert <joerg@ganneff.de>
+# Copyright (C) 2013-2016 Joerg Jaspert <joerg@ganneff.de>
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -133,7 +133,20 @@ PUPOPT="${PUPOPT} --environment ${ENVIRONMENT} --onetime --no-daemonize --detail
 # Do we wait for our lock?
 PUPWAIT=${PUPWAIT:-"false"}
 # Which lock do we use
-LOCKFILE=${LOCKFILE:-"/run/puppetgo.lock"}
+LOCKFILE=${LOCKFILE:-1}
+if [[ ${LOCKFILE} == 1 ]]; then
+    # No value configured outside, look for a possible dir for our
+    # lockfile and lastrev file
+    for possibledir in /run /var/run /var/lock; do
+        if [[ -d ${possibledir} ]]; then
+            LOCKFILE="${possibledir}/puppetgo.lock"
+            # Store the last git rev of puppet.git
+            LASTREV="${possibledir}/puppet/lastrev"
+            unset possibledir
+            break
+        fi
+    done
+fi
 # If this exists, we dont run (unless overridden)
 NORUN="/nopuppet"
 # Our output (if run by cron) goes there
@@ -143,8 +156,6 @@ TIMEOUT="/usr/bin/timeout"
 PUPPET="/usr/bin/puppet"
 FLOCK="/usr/bin/flock"
 LOCKFREE=0
-# Store the last git rev of puppet.git
-LASTREV="/run/puppet/lastrev"
 # Puppets statefile
 STATEFILE="/var/lib/puppet/state/agent_catalog_run.lock"
 # Users can force us to run, bypassing the revision checks against git
