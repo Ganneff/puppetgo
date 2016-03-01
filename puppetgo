@@ -79,8 +79,6 @@ while getopts ":pgdnhwe:x:" OPTION; do
         d) # devel
             DEVMODE="true"
             IGNNORUN="true"
-            PUPOPT=${PUPOPT:-""}
-            PUPOPT="${PUPOPT} --test"
             ;;
         n) # noop
             PUPOPT=${PUPOPT:-""}
@@ -142,6 +140,7 @@ if [[ ${LOCKFILE} == 1 ]]; then
             LOCKFILE="${possibledir}/puppetgo.lock"
             # Store the last git rev of puppet.git
             LASTREV="${possibledir}/puppet/lastrev"
+            mkdir -p "${possibledir}/puppet"
             unset possibledir
             break
         fi
@@ -165,6 +164,22 @@ RETCODE=0
 # From where to fetch git revisions to decide if we run
 GITREVURL="linpuppet.cms.fra.dlh.de/puppetgit"
 
+if [[ ! -x ${TIMEOUT} ]]; then
+    echo "No Timeout binary found, please install it."
+    echo "Still (trying to) run puppet - but no guarantee, it may hang itself"
+    TIMEOUT=""
+else
+    # Deal with old timeout versions (ancient stuff like RedHat 6)
+    # The following assumes that there isnt a timeout version saying "7.XY"
+    timeoutmin=$(timeout --version | grep -oP '8\.\K[0-9]+' || echo 42)
+    if [[ ${timeoutmin} -gt 4 ]]; then
+        TIMEOUT="${TIMEOUT} -k 400s 300s"
+    else
+        TIMEOUT="${TIMEOUT} 300s"
+    fi
+    unset timeoutmin
+fi
+
 # Rotate logfiles
 savelog() {
     torotate="$1"
@@ -183,12 +198,16 @@ savelog() {
 HUMAN="false"
 if tty -s || [[ ${DEVMODE} == true ]]; then
     # Called by human
-    PUPOPT="${PUPOPT} --verbose --no-splay --show_diff --ignorecache "
+    PUPOPT="${PUPOPT} --onetime --verbose no-usecacheonfailure --no-splay --show_diff --ignorecache "
     HUMAN="true"
 else
     # Called by cron
     exec > "${PUPLOG}" 2>&1 <&-
 fi
+
+# Puppet won't like to be run from a directory it can't access, ensure that
+# isnt the case
+cd /
 
 # All the rest runs with a lock
 (
@@ -210,8 +229,27 @@ fi
         exit 1
     fi
 
-    # If we are called by cron, we check if we really have to run.
-    # We only really run if there is
+    if [[ -f ${NORUN} ]] && [[ ${IGNNORUN} == false ]]; then
+        # We may want no puppet
+        # Note that a user wish using ${FORCEPUPPET} does not override ${NORUN} files, admins
+        # have more to say.
+        OFFTIME=$(/usr/bin/stat -c %Y ${NORUN})
+        CHECKTIME=$(( $(date +%s) - ( 60 * 60 * 24 * 2 ) ))
+        if [[ ${OFFTIME} -lt ${CHECKTIME} ]]; then
+            echo "Danger, Will Robinson! Puppet on $(hostname -s) off for more than two days!"
+            echo "${NORUN} generated on $(date -d @${OFFTIME})"
+            exit 1
+        fi
+        debug "Puppet turned off using ${NORUN}, not running"
+        if [[ ${HUMAN} == true ]]; then
+            echo "Not running, blocked by /nopuppet"
+        fi
+        exit 0
+    fi
+
+    # If we are called by cron, or if the user hasn't given -d
+    # parameter, we check if we really have to run.
+    # We then only run if there is
     #   - a change in git (new revision)
     #   - the last run is older than 12 hours
     #   - someone touched ${FORCEPUPPET} - this is used by non-administrators on the machines
@@ -219,7 +257,7 @@ fi
     #     which do not change the git revision of our puppet (say, our puppet checks out another
     #     git repository for them. When they update it, they touch ${FORCEPUPPET}, so we notice
     #     it.
-    if [[ ${HUMAN} == false ]]; then
+    if [[ ${DEVMODE} == false ]]; then
         DORUN="false"
         # Check last revision or set a string that can't exist.
         GITREV=$(cat ${LASTREV} || echo "nolastrev")
@@ -304,6 +342,9 @@ fi
             fi
         fi
         if [[ ${DORUN} == false ]]; then
+            if [[ ${HUMAN} == true ]]; then
+                echo "Not running, no change in git, last run is recent..."
+            fi
             # Nothing to do, sleep, puppet, no work
             exit 0
         fi
@@ -311,27 +352,11 @@ fi
 
     # Store the environment for the future runs
     if [[ ${PUPPERM} = true ]]; then
-        echo "${ENVIRONMENT}" > /puppetenv
-    fi
-
-    if [[ ! -f ${TIMEOUT} ]]; then
-        echo "Timeout binary not found, please install it."
-        exit 1
-    fi
-
-    if [[ -f ${NORUN} ]] && [[ ${IGNNORUN} == false ]]; then
-        # We may want no puppet
-        # Note that a user wish using ${FORCEPUPPET} does not override ${NORUN} files, admins
-        # have more to say.
-        OFFTIME=$(/usr/bin/stat -c %Y ${NORUN})
-        CHECKTIME=$(( $(date +%s) - ( 60 * 60 * 24 * 2 ) ))
-        if [[ ${OFFTIME} -lt ${CHECKTIME} ]]; then
-            echo "Danger, Will Robinson! Puppet on $(hostname -s) off for more than two days!"
-            echo "${NORUN} generated on $(date -d @${OFFTIME})"
-            exit 1
+        if [[ ${ENVIRONMENT} == production ]]; then
+            rm -f /puppetenv
+        else
+            echo "${ENVIRONMENT}" > /puppetenv
         fi
-        debug "Puppet turned off using ${NORUN}, not running"
-        exit 0
     fi
 
     # LOADS of output please
@@ -351,7 +376,7 @@ fi
     # Work, you beast, or we retry
     while [[ ${tries} -lt ${maxtries} ]]; do
         # Puppet may hang itself, guard it in timeouts
-        ${TIMEOUT} -k 400s 300s ${PUPPET} agent ${PUPOPT}
+        ${TIMEOUT} ${PUPPET} agent ${PUPOPT}
         RETCODE=$?
         case ${RETCODE} in
             124)
@@ -376,14 +401,15 @@ fi
         esac
     done
 
-    if [[ ${HUMAN} = false ]]; then
+    if [[ ${DEVMODE} = false ]]; then
         # If run by cron we store the git rev we just processed.
         # Run by humans we don't store git revisions, so we ensure at least one more automatic run
         echo "${NEWREV}" > ${LASTREV}
         exec > /dev/null 2>&1
         savelog "${PUPLOG}"
     fi
-) 42>>${LOCKFILE}
 
-# Return the same code as puppet (well, except 2=0)
-exit ${RETCODE}
+    # Return the same code as puppet (well, except 2=0)
+    exit ${RETCODE}
+
+) 42>>${LOCKFILE}
