@@ -348,6 +348,17 @@ cd /
             # Nothing to do, sleep, puppet, no work
             exit 0
         fi
+    elif [[ ${HUMAN} == true ]]; then
+        # Check if the human specified a nonexisting env and warn, dont run puppet
+        set +e
+        maybeerr=$(wget -O /dev/null -q -S ${GITREVURL}/${ENVIRONMENT} 2>&1)
+        set -e
+        errreg="HTTP/1.1 404 Not Found.*"
+        if [[ ${maybeerr} =~ ${errreg} ]]; then
+            # Right, the env does not exist
+            echo "The environment ${ENVIRONMENT} you want does not exist, not running puppet..."
+            exit 42
+        fi
     fi
 
     # Store the environment for the future runs
