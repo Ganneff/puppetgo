@@ -198,7 +198,7 @@ savelog() {
 HUMAN="false"
 if tty -s || [[ ${DEVMODE} == true ]]; then
     # Called by human
-    PUPOPT="${PUPOPT} --onetime --verbose no-usecacheonfailure --no-splay --show_diff --ignorecache "
+    PUPOPT="${PUPOPT} --onetime --verbose --no-usecacheonfailure --no-splay --show_diff --ignorecache "
     HUMAN="true"
 else
     # Called by cron
