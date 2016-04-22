@@ -224,7 +224,7 @@ cd /
     # Did we get the lock?
     if [[ $LOCKFREE -gt 0 ]]; then
         if [[ ${HUMAN} == true ]]; then
-            echo "Lock ${LOCKFILE} exists"
+            echo "Lock ${LOCKFILE} in use by another puppetgo. Call me with -w or get lost."
         fi
         exit 1
     fi
