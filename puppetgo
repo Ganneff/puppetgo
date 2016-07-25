@@ -140,6 +140,9 @@ if [[ ${LOCKFILE} == 1 ]]; then
             LOCKFILE="${possibledir}/puppetgo.lock"
             # Store the last git rev of puppet.git
             LASTREV="${possibledir}/puppet/lastrev"
+            # If last run didn't succeed due to timeout, we will add
+            # a random delay before running again. Store last exit code.
+            LASTEXITFILE="${possibledir}/puppet/lastexit"
             mkdir -p "${possibledir}/puppet"
             unset possibledir
             break
@@ -163,6 +166,8 @@ FORCEPUPPET="/tmp/forcepuppet"
 RETCODE=0
 # From where to fetch git revisions to decide if we run
 GITREVURL="linpuppet.cms.fra.dlh.de/puppetgit"
+# Fetch last exit code
+LASTEXITCODE=$(cat ${LASTEXITFILE} || echo 0)
 
 if [[ ! -x ${TIMEOUT} ]]; then
     echo "No Timeout binary found, please install it."
@@ -247,6 +252,14 @@ cd /
         exit 0
     fi
 
+    if [[ ${LASTEXITCODE} -ne 0 ]] && [[ ${HUMAN} == false ]]; then
+        # Seems last run failed somehow
+        delaytime=$(( $RANDOM % 240 ))
+        echo "Last run may have failed, delaying startup by ${delaytime}"
+        sleep ${delaytime}
+        unset delaytime
+    fi
+
     # If we are called by cron, or if the user hasn't given -d
     # parameter, we check if we really have to run.
     # We then only run if there is
@@ -274,9 +287,8 @@ cd /
 
         # wgets error codes aren't all that nice and detailed, but work with em
         case ${ret} in
-            8) if [[ ${GITREV} != nolastrev ]] && [[ ${ENVIRONMENT} != production ]]; then
-                   # IF we had a gitrev (ie environment existed in past run)
-                   # AND we are not in production
+            8) if [[ ${ENVIRONMENT} != production ]]; then
+                   # IF we are not in production
                    # AND it seems like the environment no longer exists (wget error 8)
 
                    # -> Check if it really no longer exists, or if its a temp error
@@ -419,6 +431,9 @@ cd /
         exec > /dev/null 2>&1
         savelog "${PUPLOG}"
     fi
+
+    # Store last exit code
+    echo ${RETCODE} > ${LASTEXITFILE}
 
     # Return the same code as puppet (well, except 2=0)
     exit ${RETCODE}
