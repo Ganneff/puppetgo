@@ -5,7 +5,7 @@
 ## Edit on your workstation, clone the repository using 'clone-puppet'
 ##
 
-# Copyright (C) 2013-2016 Joerg Jaspert <joerg@ganneff.de>
+# Copyright (C) 2013-2021 Joerg Jaspert <joerg@ganneff.de>
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -37,14 +37,22 @@ set -u
 set -E
 
 debug() {
-    if [[ ${DEBUG} = false ]]; then
-        return
-    fi
-    echo "$@"
+  if [[ ${DEBUG} = false ]]; then
+    return
+  fi
+  log "$@"
+}
+
+# Function log
+# Logs the arguments. Basically echos it in a syslog-like format.
+#
+# If variable PROGRAM is defined this will be added to the output.
+function log () {
+    echo "$(/bin/date +"%b %d %H:%M:%S") $@"
 }
 
 usage() {
-    cat <<EOF
+  cat <<EOF
 Puppetgo helper by Joerg Jaspert <joerg@ganneff.de>
 
 Either call with no argument for default behaviour or chose one
@@ -57,62 +65,141 @@ of the following:
 -n  Noop mode.  Sets --noop option for puppet.
 -e  Environment selection. p, prod, production all mean production,
                 all others are given direct to puppet
--p  Make the environment permanent - that is, put it into /puppetenv
+-b  Base Environment. If an environment does not exist, puppet falls back
+                to its base. If not given this defaults to production.
+-p  Make options permanent - that is, put them into /puppetenv
+                The following options are remembered: -n, -e, -x, -b
 -x  Extra params for puppet. Whatever is not supported by other
                 options can be set for puppet.
 -w  Wait mode. Waits for a (maybe) running puppet to finish and then runs.
 -h  This screen.
 
 EOF
-    exit 0
+  exit 0
 }
 
-if [[ -f /puppetenv ]]; then
-    ENVIRONMENT=$(cat /puppetenv)
-fi
+# Trim a string, remove leading and trailing whitespace
+trim() {
+  local var="$*"
+  # remove leading whitespace characters
+  var="${var#"${var%%[![:space:]]*}"}"
+  # remove trailing whitespace characters
+  var="${var%"${var##*[![:space:]]}"}"
+  printf "%s" "$var"
+}
+
+writepuppetenv() {
+  local file=${1:-"/puppetenv"}
+  local ENVIRONMENT=""
+  local NOOP=""
+  local BASEENVIRONMENT=""
+  local OPTS=""
+  local OPTIND
+
+  while getopts ":e:nb:x:" OPTION ${NONDEFOPTS[@]}; do
+	case ${OPTION} in
+      e)  ENVIRONMENT="-e ${OPTARG}"
+		  ;;
+	  n)  NOOP="-n"
+		  ;;
+	  b)  BASEENVIRONMENT="-b ${OPTARG}"
+		  ;;
+	  x)  OPTS="-x ${OPTARG}"
+		  ;;
+	esac
+  done
+
+  if [[ ${ENVIRONMENT} == -e\ production ]]; then
+    # prod is the default
+    ENVIRONMENT=""
+    # prod doesn't have fallback
+    BASEENVIRONMENT=""
+  fi
+  if [[ ${ENVIRONMENT##* } == ${BASEENVIRONMENT##* } ]]; then
+    # Base is same as main, get rid of base arg
+    BASEENVIRONMENT=""
+  fi
+
+  NEWSTRING=$(trim "${ENVIRONMENT} ${NOOP} ${BASEENVIRONMENT} ${OPTS}")
+  if [[ -z ${NEWSTRING} ]]; then
+    # No options to keep left
+    rm -f ${file}
+  else
+    # The nice variable statement cleans up *trailing* whitespace (ONLY)
+    printf "%s\n" "${NEWSTRING}" > ${file}
+  fi
+}
 
 declare -a PUPOPT=(${PUPOPT:-})
+declare -a NONDEFOPTS
 
-while getopts ":pgdnhwe:x:" OPTION; do
-    case ${OPTION} in
-        g) # debug
-            DEBUG="true"
-            ;;
-        d) # devel
-            DEVMODE="true"
-            IGNNORUN="true"
-            ;;
-        n) # noop
-            PUPOPT+=("--noop")
-            ;;
-        h) # help
-            usage
-            exit 0
-            ;;
-        e) # environment
-            case ${OPTARG} in
-                p|prod|production)
-                    ENVIRONMENT="production"
-                    ;;
-                *)
-                    ENVIRONMENT=${OPTARG}
-                    ;;
-            esac
-            ;;
-        x) # extra params for puppet
-            PUPOPT+=(${OPTARG})
-            ;;
-        p) # env permanent
-            PUPPERM="true"
-            ;;
-        w) # wait for other puppet to finish
-            PUPWAIT="true"
-            ;;
-        ?)
-            echo "Unknown option given, try -h"
-            exit 42
-            ;;
-    esac
+if [[ -f /puppetenv ]]; then
+  CMDLINE=$(cat /puppetenv)
+  # Drop whitespace
+  CMDLINE=$(trim ${CMDLINE#* })
+  if [[ ${CMDLINE:0:1} != - ]]; then
+    # Old style puppetenv, convert
+    CMDLINE="-e ${CMDLINE}"
+    NONDEFOPTS+=(${CMDLINE})
+    writepuppetenv
+  fi
+  set -- ${CMDLINE} $*
+fi
+
+while getopts ":pgdnhwe:x:b:" OPTION; do
+  case ${OPTION} in
+    g) # debug
+      DEBUG="true"
+      ;;
+    d) # devel
+      DEVMODE="true"
+      IGNNORUN="true"
+      ;;
+    n) # noop
+      PUPOPT+=("--noop")
+      NONDEFOPTS+=("-n")
+      ;;
+    h) # help
+      usage
+      exit 0
+      ;;
+    e) # environment
+      case ${OPTARG} in
+        p|prod|production)
+          ENVIRONMENT="production"
+          ;;
+        *)
+          ENVIRONMENT=${OPTARG}
+          ;;
+      esac
+      NONDEFOPTS+=("-e ${ENVIRONMENT}")
+      ;;
+    b) # base environment
+      case ${OPTARG} in
+        p|prod|production)
+          BASEENVIRONMENT="production"
+          ;;
+        *)
+          BASEENVIRONMENT=${OPTARG}
+          ;;
+      esac
+      NONDEFOPTS+=("-b ${BASEENVIRONMENT}")
+      ;;
+    x) # extra params for puppet
+      PUPOPT+=(${OPTARG})
+      NONDEFOPTS+=("-x ${OPTARG}")
+      ;;
+    p) # options permanent
+      PUPPERM="true"
+      ;;
+    w) # wait for other puppet to finish
+      PUPWAIT="true"
+      ;;
+    ?)
+    echo "Unknown option given, try -h"
+    exit 42
+    ;;
+  esac
 done
 
 # Should we output debug log
@@ -123,42 +210,90 @@ DEVMODE=${DEVMODE:-"false"}
 IGNNORUN=${IGNNORUN:-"false"}
 # In which environment do we run puppet
 ENVIRONMENT=${ENVIRONMENT:-"production"}
+# Which env to fall back to if given one does not exist
+BASEENVIRONMENT=${BASEENVIRONMENT:-"production"}
 # Make the environment permanent?
 PUPPERM=${PUPPERM:-"false"}
 # Which puppet options do we use
-PUPOPT+=(--environment ${ENVIRONMENT} --onetime --no-daemonize --detailed-exitcodes)
+PUPOPT+=(--environment ${ENVIRONMENT} --onetime --no-daemonize --detailed-exitcodes --show_diff)
 # Do we wait for our lock?
 PUPWAIT=${PUPWAIT:-"false"}
 # Which lock do we use
 LOCKFILE=${LOCKFILE:-1}
 if [[ ${LOCKFILE} == 1 ]]; then
-    # No value configured outside, look for a possible dir for our
-    # lockfile and lastrev file
-    for possibledir in /run /var/run /var/lock; do
-        if [[ -d ${possibledir} ]]; then
-            LOCKFILE="${possibledir}/puppetgo.lock"
-            # Store the last git rev of puppet.git
-            LASTREV="${possibledir}/puppet/lastrev"
-            # If last run didn't succeed due to timeout, we will add
-            # a random delay before running again. Store last exit code.
-            LASTEXITFILE="${possibledir}/puppet/lastexit"
-            mkdir -p "${possibledir}/puppet"
-            unset possibledir
-            break
-        fi
-    done
+  # No value configured outside, look for a possible dir for our
+  # lockfile and lastrev file
+  for possibledir in /run /var/run /var/lock; do
+    if [[ -d ${possibledir} ]]; then
+      LOCKFILE="${possibledir}/puppetgo.lock"
+      # Store the last git rev of puppet.git
+      LASTREV="${possibledir}/puppet/lastrev"
+      # If last run didn't succeed due to timeout, we will add
+      # a random delay before running again. Store last exit code.
+      LASTEXITFILE="${possibledir}/puppet/lastexit"
+      mkdir -p "${possibledir}/puppet"
+      unset possibledir
+      break
+    fi
+  done
 fi
 # If this exists, we dont run (unless overridden)
 NORUN="/nopuppet"
 # Our output (if run by cron) goes there
-PUPLOG="/var/log/puppet/cron"
+PUPLOG=""
+for d in /var/log/puppet /var/log/puppetlabs; do
+  if [[ -d ${d} ]]; then
+    PUPLOG="${d}/cron"
+  fi
+done
+if [[ -z ${PUPLOG} ]]; then
+  log "Could not determine log directory"
+  exit 2
+fi
 # Pathes to binaries
 TIMEOUT="/usr/bin/timeout"
-PUPPET="/usr/bin/puppet"
+PUPPET=""
+for d in /usr/bin /opt/puppetlabs/bin; do
+  if [[ -f ${d}/puppet ]]; then
+    PUPPET="${d}/puppet"
+  fi
+done
+if [[ -z ${PUPPET} ]]; then
+  log "Could not find puppet binary"
+  exit 2
+fi
 FLOCK="/usr/bin/flock"
+TS="/usr/bin/ts"
+if [[ ! -x ${TS} ]]; then
+  TS="/usr/bin/xargs echo"
+fi
+
 LOCKFREE=0
 # Puppets statefile
-STATEFILE="/var/lib/puppet/state/agent_catalog_run.lock"
+STATEFILE=""
+for d in /var/lib/puppet/state /opt/puppetlabs/puppet/cache/state; do
+  if [[ -d ${d} ]]; then
+    STATEFILE="${d}/agent_catalog_run.lock"
+    if [[ -f ${d}/last_run_report.yaml ]]; then
+      LASTRUN=$(awk -F "'" '/^time:/ { print $2}' ${d}/last_run_report.yaml)
+      datesecs=$(date -d ${LASTRUN} +%s)
+      now=$(date +%s)
+      diff=$(( now - datesecs ))
+      gap=$(printf '%dd:%dh:%dm:%ds\n' $((diff/86400)) $((diff%86400/3600)) $((diff%3600/60))   $((diff%60)) )
+      LASTENV=$(grep ^environment: ${d}/last_run_report.yaml)
+      LASTRUNTYPE=$(grep ^noop: ${d}/last_run_report.yaml)
+    else
+      LASTRUN=unknown
+      LASTENV=unknown
+      LASTRUNTYPE=unknown
+      gap="0s"
+    fi
+  fi
+done
+if [[ -z ${STATEFILE} ]]; then
+  log "Could not locate statefile dir"
+  exit 2
+fi
 # Users can force us to run, bypassing the revision checks against git
 FORCEPUPPET="/tmp/forcepuppet"
 # Our return code
@@ -166,47 +301,48 @@ RETCODE=0
 # From where to fetch git revisions to decide if we run
 GITREVURL="linpuppet.cms.fra.dlh.de/puppetgit"
 # Fetch last exit code
-LASTEXITCODE=$(cat ${LASTEXITFILE} || echo 0)
+LASTEXITCODE=$(cat ${LASTEXITFILE} 2>/dev/null || echo 0)
 
 if [[ ! -x ${TIMEOUT} ]]; then
-    echo "No Timeout binary found, please install it."
-    echo "Still (trying to) run puppet - but no guarantee, it may hang itself"
-    TIMEOUT=""
+  log "No Timeout binary found, please install it."
+  log "Still (trying to) run puppet - but no guarantee, it may hang itself"
+  TIMEOUT=""
 else
-    # Deal with old timeout versions (ancient stuff like RedHat 6)
-    # The following assumes that there isnt a timeout version saying "7.XY"
-    timeoutmin=$(timeout --version | grep -oP '8\.\K[0-9]+' || echo 42)
-    if [[ ${timeoutmin} -gt 4 ]]; then
-        TIMEOUT="${TIMEOUT} -k 400s 300s"
-    else
-        TIMEOUT="${TIMEOUT} 300s"
-    fi
-    unset timeoutmin
+  # Deal with old timeout versions (ancient stuff like RedHat 6)
+  # The following assumes that there isnt a timeout version saying "7.XY"
+  timeoutmin=$(timeout --version | grep -oP '8\.\K[0-9]+' || echo 42)
+  if [[ ${timeoutmin} -gt 4 ]]; then
+    TIMEOUT="${TIMEOUT} -k 800s 600s"
+  else
+    TIMEOUT="${TIMEOUT} 600s"
+  fi
+  unset timeoutmin
 fi
 
 # Rotate logfiles
 savelog() {
-    torotate="$1"
-    count=${2:-14}
-    while [[ ${count} -gt 0 ]]; do
-        prev=$(( count - 1 ))
-        if [ -e "${torotate}.${prev}" ]; then
-            mv "${torotate}.${prev}" "${torotate}.${count}"
-        fi
-        count=$prev
-    done
-    mv "${torotate}" "${torotate}.0"
+  torotate="$1"
+  count=${2:-14}
+  while [[ ${count} -gt 0 ]]; do
+    prev=$(( count - 1 ))
+    if [ -e "${torotate}.${prev}" ]; then
+      mv "${torotate}.${prev}" "${torotate}.${count}"
+    fi
+    count=$prev
+  done
+  mv "${torotate}" "${torotate}.0"
 }
 
 # A human, detected by a tty or devmode option, gets some more puppet options
 HUMAN="false"
 if tty -s || [[ ${DEVMODE} == true ]]; then
-    # Called by human
-    PUPOPT+=( --onetime --verbose --no-usecacheonfailure --no-splay --show_diff --ignorecache)
-    HUMAN="true"
+  # Called by human
+  PUPOPT+=( --onetime --verbose --no-usecacheonfailure --no-splay --trace )
+  HUMAN="true"
+  log "Last Puppet run: ${LASTRUN} -- ${gap} ago, ${LASTENV} (${LASTRUNTYPE})"
 else
-    # Called by cron
-    exec > "${PUPLOG}" 2>&1 <&-
+  # Called by cron
+  exec > "${PUPLOG}" 2>&1 <&-
 fi
 
 # Puppet won't like to be run from a directory it can't access, ensure that
@@ -215,226 +351,237 @@ cd /
 
 # All the rest runs with a lock
 (
-    # If called by a human or the pupwait option is set, we wait a bit of time for the lock
-    if [[ ${PUPWAIT} == true ]] && [[ ${HUMAN} == true ]]; then
-        if [[ -f ${STATEFILE} ]]; then
-            echo "There may be another puppet, we may be waiting up to 2 minutes. Be patient."
-        fi
-        ${FLOCK} --exclusive --wait 120 42 || LOCKFREE=1
-    else
-        ${FLOCK} --exclusive --nonblock 42 || LOCKFREE=1
+  # If called by a human or the pupwait option is set, we wait a bit of time for the lock
+  if [[ ${PUPWAIT} == true ]] && [[ ${HUMAN} == true ]]; then
+    if [[ -f ${STATEFILE} ]]; then
+      log "There may be another puppet, we may be waiting up to 2 minutes. Be patient."
     fi
+    ${FLOCK} --exclusive --wait 120 42 || LOCKFREE=1
+  else
+    ${FLOCK} --exclusive --nonblock 42 || LOCKFREE=1
+  fi
 
-    # Did we get the lock?
-    if [[ $LOCKFREE -gt 0 ]]; then
-        if [[ ${HUMAN} == true ]]; then
-            echo "Lock ${LOCKFILE} in use by another puppetgo. Call me with -w or get lost."
-        fi
+  # Did we get the lock?
+  if [[ $LOCKFREE -gt 0 ]]; then
+    if [[ ${HUMAN} == true ]]; then
+      log "Lock ${LOCKFILE} in use by another puppetgo. Call me with -w or get lost."
+    fi
+    exit 1
+  fi
+
+  if [[ -f ${NORUN} ]] && [[ ${IGNNORUN} == false ]]; then
+    # We may want no puppet
+    # Note that a user wish using ${FORCEPUPPET} does not override ${NORUN} files, admins
+    # have more to say.
+    OFFTIME=$(/usr/bin/stat -c %Y ${NORUN})
+    CHECKTIME=$(( $(date +%s) - ( 60 * 60 * 24 * 2 ) ))
+    if [[ ${OFFTIME} -lt ${CHECKTIME} ]]; then
+      log "Danger, Will Robinson! Puppet on $(hostname -s) off for more than two days!"
+      log "${NORUN} generated on $(date -d "@${OFFTIME}")"
+      exit 1
+    fi
+    debug "Puppet turned off using ${NORUN}, not running"
+    if [[ ${HUMAN} == true ]]; then
+      log "Not running, blocked by /nopuppet"
+    fi
+    exit 0
+  fi
+
+  if [[ ${LASTEXITCODE} -ne 0 ]] && [[ ${HUMAN} == false ]]; then
+    # Seems last run failed somehow
+    delaytime=$(( RANDOM % 240 ))
+    log "Last run may have failed, delaying startup by ${delaytime}"
+    sleep ${delaytime}
+    unset delaytime
+  fi
+
+  # If we are called by cron, or if the user hasn't given -d
+  # parameter, we check if we really have to run.
+  # We then only run if there is
+  #   - a change in git (new revision)
+  #   - the last run is older than 12 hours
+  #   - someone touched ${FORCEPUPPET} - this is used by non-administrators on the machines
+  #     to "ask" for a puppet run. Useful if they have services managed by our puppet - but
+  #     which do not change the git revision of our puppet (say, our puppet checks out another
+  #     git repository for them. When they update it, they touch ${FORCEPUPPET}, so we notice
+  #     it.
+  if [[ ${DEVMODE} == false ]]; then
+    DORUN="false"
+    # Check last revision or set a string that can't exist.
+    GITREV=$(cat ${LASTREV} 2>/dev/null || echo "nolastrev")
+    if [[ ${GITREV} == Miaubar ]]; then
+      # Catch mistake of suddenly having a "Miaubar" "lastrev", which would make
+      # us skip all the following automatic runs...
+      GITREV="brokenlastrev"
+    fi
+    # Simple one-liner files per environment, generated by a simple git rev-parse HEAD for the branch
+    NEWREV=$(wget -q "${GITREVURL}/${ENVIRONMENT}" -O -)
+    ret=$?
+
+    # wgets error codes aren't all that nice and detailed, but work with em
+    case ${ret} in
+      8) if [[ ${ENVIRONMENT} != production ]]; then
+           # IF we are not in production
+           # AND it seems like the environment no longer exists (wget error 8)
+
+           # -> Check if it really no longer exists, or if its a temp error
+           maybeerr=$(wget -O /dev/null -q -S "${GITREVURL}/${ENVIRONMENT}" 2>&1)
+           errreg="HTTP/1.1 404 Not Found.*"
+           if [[ ${maybeerr} =~ ${errreg} ]]; then
+             # Yes, the environment we are in (maybe) no
+             # longer exists
+
+             # Now, there can be a "race condition" which we
+             # should work around: With a puppet setup where
+             # branches are used a lot to develop features,
+             # environments come and go. Sometimes those
+             # environments need to be rebased, but should
+             # continue with the same name (and on the same
+             # machines). It then happens that one does a
+             # git push origin :branch && git push origin branch
+             # and with this deleting the old one, then
+             # pushing the "new" (rebased) branch.
+
+             # This happens to make the environment
+             # non-existent for a while, and even if that
+             # while is only a few seconds, may mean that
+             # machines using it accidently switch to the
+             # production environment.
+
+             # While this is not an error in puppetgo we
+             # work around this by only switching back to
+             # production if the target environment doesn't
+             # exist for two puppetgo runs in a row.
+             if [[ ${GITREV} != firstrunnoenv ]]; then
+               echo "firstrunnoenv" > ${LASTREV}
+             else
+               NONDEFOPTS+=("-e ${BASEENVIRONMENT}")
+               writepuppetenv
+             fi
+             # And out
+             exit 0
+           fi
+         fi
+         ;;&
+      0)  # Its all fine, so we have nothing to adjust here
+        # Just need to ensure we don't end in the *) match
+        :
+        ;;
+      *) NEWREV="Miaubar"
+         ;;
+    esac
+
+    if [[ ${GITREV} != ${NEWREV} ]] || [[ -f ${FORCEPUPPET} ]]; then
+      # If there is a new git rev - or if a user asked for a run
+      DORUN="true"
+      rm -f ${FORCEPUPPET}
+    else
+      # Check how long ago we did a run
+      ctime=$(date +%s)
+      ftime=$(stat -c %Y ${LASTREV})
+      diff=$(( ctime - ftime ))
+      if [[ ${diff} -gt 43200 ]]; then
+        # More than 12 hours ago, run
+        DORUN="true"
+      fi
+    fi
+    if [[ ${DORUN} == false ]]; then
+      if [[ ${HUMAN} == true ]]; then
+        log "Not running, no change in git, last run is recent..."
+      fi
+      # Nothing to do, sleep, puppet, no work
+      exit 0
+    fi
+  elif [[ ${HUMAN} == true ]]; then
+    # Check if the human specified a nonexisting env and warn, dont run puppet
+    maybeerr=$(wget -O /dev/null -q -S "${GITREVURL}/${ENVIRONMENT}" 2>&1)
+    errreg="HTTP/1.1 404 Not Found.*"
+    if [[ ${maybeerr} =~ ${errreg} ]]; then
+      # Right, the env does not exist
+      log "The environment ${ENVIRONMENT} you want does not exist, not running puppet..."
+      if [[ -n ${BASEENVIRONMENT} ]]; then
+        log "You gave me a base environment of ${BASEENVIRONMENT}, switching over"
+        NONDEFOPTS+=("-e ${BASEENVIRONMENT}")
+        writepuppetenv
+        log "Switched, you want to rerun me"
         exit 1
+      else
+        log "No base environment known, decide what you want to do"
+        exit 42
+      fi
     fi
+  fi
 
-    if [[ -f ${NORUN} ]] && [[ ${IGNNORUN} == false ]]; then
-        # We may want no puppet
-        # Note that a user wish using ${FORCEPUPPET} does not override ${NORUN} files, admins
-        # have more to say.
-        OFFTIME=$(/usr/bin/stat -c %Y ${NORUN})
-        CHECKTIME=$(( $(date +%s) - ( 60 * 60 * 24 * 2 ) ))
-        if [[ ${OFFTIME} -lt ${CHECKTIME} ]]; then
-            echo "Danger, Will Robinson! Puppet on $(hostname -s) off for more than two days!"
-            echo "${NORUN} generated on $(date -d "@${OFFTIME}")"
-            exit 1
-        fi
-        debug "Puppet turned off using ${NORUN}, not running"
-        if [[ ${HUMAN} == true ]]; then
-            echo "Not running, blocked by /nopuppet"
-        fi
-        exit 0
-    fi
+  # Store the environment for the future runs
+  if [[ ${PUPPERM} = true ]]; then
+    writepuppetenv
+  fi
 
-    if [[ ${LASTEXITCODE} -ne 0 ]] && [[ ${HUMAN} == false ]]; then
-        # Seems last run failed somehow
-        delaytime=$(( RANDOM % 240 ))
-        echo "Last run may have failed, delaying startup by ${delaytime}"
-        sleep ${delaytime}
-        unset delaytime
-    fi
+  # LOADS of output please
+  if [[ ${DEBUG} != false ]]; then
+    PUPOPT+=(--debug)
+  fi
 
-    # If we are called by cron, or if the user hasn't given -d
-    # parameter, we check if we really have to run.
-    # We then only run if there is
-    #   - a change in git (new revision)
-    #   - the last run is older than 12 hours
-    #   - someone touched ${FORCEPUPPET} - this is used by non-administrators on the machines
-    #     to "ask" for a puppet run. Useful if they have services managed by our puppet - but
-    #     which do not change the git revision of our puppet (say, our puppet checks out another
-    #     git repository for them. When they update it, they touch ${FORCEPUPPET}, so we notice
-    #     it.
-    if [[ ${DEVMODE} == false ]]; then
-        DORUN="false"
-        # Check last revision or set a string that can't exist.
-        GITREV=$(cat ${LASTREV} || echo "nolastrev")
-        if [[ ${GITREV} == Miaubar ]]; then
-            # Catch mistake of suddenly having a "Miaubar" "lastrev", which would make
-            # us skip all the following automatic runs...
-            GITREV="brokenlastrev"
-        fi
-        set +e
-        # Simple one-liner files per environment, generated by a simple git rev-parse HEAD for the branch
-        NEWREV=$(wget -q "${GITREVURL}/${ENVIRONMENT}" -O -)
-        ret=$?
-        set -e
+  tries=0
+  # Human run with -d, dont repeat on errors, thats usually just annoying
+  if [[ ${DEVMODE} == true ]]; then
+    maxtries=1
+  else
+    # No -d, so possibly automatic - puppet may need a rerun, try it 2 times
+    maxtries=2
+  fi
 
-        # wgets error codes aren't all that nice and detailed, but work with em
-        case ${ret} in
-            8) if [[ ${ENVIRONMENT} != production ]]; then
-                   # IF we are not in production
-                   # AND it seems like the environment no longer exists (wget error 8)
 
-                   # -> Check if it really no longer exists, or if its a temp error
-                   set +e
-                   maybeerr=$(wget -O /dev/null -q -S "${GITREVURL}/${ENVIRONMENT}" 2>&1)
-                   set -e
-                   errreg="HTTP/1.1 404 Not Found.*"
-                   if [[ ${maybeerr} =~ ${errreg} ]]; then
-                       # Yes, the environment we are in (maybe) no
-                       # longer exists
-
-                       # Now, there can be a "race condition" which we
-                       # should work around: With a puppet setup where
-                       # branches are used a lot to develop features,
-                       # environments come and go. Sometimes those
-                       # environments need to be rebased, but should
-                       # continue with the same name (and on the same
-                       # machines). It then happens that one does a
-                       # git push origin :branch && git push origin branch
-                       # and with this deleting the old one, then
-                       # pushing the "new" (rebased) branch.
-
-                       # This happens to make the environment
-                       # non-existent for a while, and even if that
-                       # while is only a few seconds, may mean that
-                       # machines using it accidently switch to the
-                       # production environment.
-
-                       # While this is not an error in puppetgo we
-                       # work around this by only switching back to
-                       # production if the target environment doesn't
-                       # exist for two puppetgo runs in a row.
-                       if [[ ${GITREV} != firstrunnoenv ]]; then
-                           echo "firstrunnoenv" > ${LASTREV}
-                       else
-                           rm /puppetenv
-                       fi
-                       # And out
-                       exit 0
-                   fi
-               fi
-               ;;&
-            0)  # Its all fine, so we have nothing to adjust here
-                # Just need to ensure we don't end in the *) match
-                :
-                ;;
-            *) NEWREV="Miaubar"
-               ;;
-        esac
-
-        if [[ ${GITREV} != ${NEWREV} ]] || [[ -f ${FORCEPUPPET} ]]; then
-            # If there is a new git rev - or if a user asked for a run
-            DORUN="true"
-            rm -f ${FORCEPUPPET}
+  # Work, you beast, or we retry
+  while [[ ${tries} -lt ${maxtries} ]]; do
+    # Goodbye rerunpuppet - if puppet creates it again, we will be back here.
+    rm -f /tmp/rerunpuppet
+    # Puppet may hang itself, guard it in timeouts
+    ${TIMEOUT} ${PUPPET} agent "${PUPOPT[@]}" 2>&1 | ${TS}
+    RETCODE=$?
+    case ${RETCODE} in
+      124)
+        # Timed out
+        log "Das war nix, timeout hit..."
+        ;;&
+      4|6)
+        ## According to puppet agent --help those two indicate "there was a failure".
+        ## So we retry the puppet run, and see if it goes away (sometimes it needs
+        ## multiple runs to get all of it)
+        debug "Ein Satz mit X, das war wohl nix, nochmaaaaaaaaaaaaal. (Exit ${RETCODE})"
+        tries=$(( tries +1 ))
+        continue
+        ;;
+      2)
+        ## Just had some changes, not an error
+        RETCODE=0
+        ;;&
+      *)
+        # Whatever else in return ought to let us leave, except if puppet wants us to rerun
+        if [[ -f /tmp/rerunpuppet ]]; then
+          # Would be ok, but we are asked to rerun, so lets do it. Without incrementing tries, thats for errors
+          # only!
+          log "RERUN trigger found, going to have another round of puppet"
+          continue
         else
-            # Check how long ago we did a run
-            ctime=$(date +%s)
-            ftime=$(stat -c %Y ${LASTREV})
-            diff=$(( ctime - ftime ))
-            if [[ ${diff} -gt 43200 ]]; then
-                # More than 12 hours ago, run
-                DORUN="true"
-            fi
+          break
         fi
-        if [[ ${DORUN} == false ]]; then
-            if [[ ${HUMAN} == true ]]; then
-                echo "Not running, no change in git, last run is recent..."
-            fi
-            # Nothing to do, sleep, puppet, no work
-            exit 0
-        fi
-    elif [[ ${HUMAN} == true ]]; then
-        # Check if the human specified a nonexisting env and warn, dont run puppet
-        set +e
-        maybeerr=$(wget -O /dev/null -q -S "${GITREVURL}/${ENVIRONMENT}" 2>&1)
-        set -e
-        errreg="HTTP/1.1 404 Not Found.*"
-        if [[ ${maybeerr} =~ ${errreg} ]]; then
-            # Right, the env does not exist
-            echo "The environment ${ENVIRONMENT} you want does not exist, not running puppet..."
-            exit 42
-        fi
-    fi
+        ;;
+    esac
+  done
 
-    # Store the environment for the future runs
-    if [[ ${PUPPERM} = true ]]; then
-        if [[ ${ENVIRONMENT} == production ]]; then
-            rm -f /puppetenv
-        else
-            echo "${ENVIRONMENT}" > /puppetenv
-        fi
-    fi
+  if [[ ${DEVMODE} = false ]]; then
+    # If run by cron we store the git rev we just processed.
+    # Run by humans we don't store git revisions, so we ensure at least one more automatic run
+    echo "${NEWREV}" > ${LASTREV}
+    exec > /dev/null 2>&1
+    savelog "${PUPLOG}"
+  fi
 
-    # LOADS of output please
-    if [[ ${DEBUG} != false ]]; then
-        PUPOPT+=(--debug)
-    fi
+  # Store last exit code
+  echo ${RETCODE} > ${LASTEXITFILE}
 
-    tries=0
-    # Human run with -d, dont repeat on errors, thats usually just annoying
-    if [[ ${DEVMODE} == true ]]; then
-        maxtries=1
-    else
-        # No -d, so possibly automatic - puppet may need a rerun, try it 2 times
-        maxtries=2
-    fi
-
-    # Work, you beast, or we retry
-    while [[ ${tries} -lt ${maxtries} ]]; do
-        # Puppet may hang itself, guard it in timeouts
-        ${TIMEOUT} ${PUPPET} agent "${PUPOPT[@]}"
-        RETCODE=$?
-        case ${RETCODE} in
-            124)
-                # Timed out
-                echo "Das war nix, timeout hit..."
-                ;;&
-            4|6)
-                ## According to puppet agent --help those two indicate "there was a failure".
-                ## So we retry the puppet run, and see if it goes away (sometimes it needs
-                ## multiple runs to get all of it)
-                debug "Ein Satz mit X, das war wohl nix, nochmaaaaaaaaaaaaal. (Exit ${RETCODE})"
-                tries=$(( tries +1 ))
-                continue
-                ;;
-            2)
-                ## Just had some changes, not an error
-                RETCODE=0
-                ;;&
-            *)
-                break
-                ;;
-        esac
-    done
-
-    if [[ ${DEVMODE} = false ]]; then
-        # If run by cron we store the git rev we just processed.
-        # Run by humans we don't store git revisions, so we ensure at least one more automatic run
-        echo "${NEWREV}" > ${LASTREV}
-        exec > /dev/null 2>&1
-        savelog "${PUPLOG}"
-    fi
-
-    # Store last exit code
-    echo ${RETCODE} > ${LASTEXITFILE}
-
-    # Return the same code as puppet (well, except 2=0)
-    exit ${RETCODE}
+  # Return the same code as puppet (well, except 2=0)
+  exit ${RETCODE}
 
 ) 42>>${LOCKFILE}
