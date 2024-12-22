@@ -1,2 +1,1 @@
-# puppetgo
-Puppet agent run helper
+Migrated to <https://codeberg.org/Ganneff/puppetgo>
